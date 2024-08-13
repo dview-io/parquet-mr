@@ -21,7 +21,7 @@
     <groupId>org.apache.parquet</groupId>
     <artifactId>parquet</artifactId>
     <relativePath>../pom.xml</relativePath>
-    <version>1.14.0-SNAPSHOT</version>
+    <version>1.15.0-SNAPSHOT</version>
   </parent>
 
   <modelVersion>4.0.0</modelVersion>
@@ -36,6 +36,11 @@
     <dependency>
       <groupId>com.fasterxml.jackson.core</groupId>
       <artifactId>jackson-core</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>${jackson.groupId}</groupId>
+      <artifactId>jackson-annotations</artifactId>
       <version>${jackson.version}</version>
     </dependency>
     <dependency>
@@ -70,11 +75,18 @@
               <artifactSet>
                 <includes>
                   <include>${jackson.groupId}:*</include>
+                  <include>${jackson.datatype.groupId}:*</include>
                 </includes>
               </artifactSet>
               <filters>
                 <filter>
                   <artifact>${jackson.groupId}:*</artifact>
+                  <includes>
+                    <include>**</include>
+                  </includes>
+                </filter>
+                <filter>
+                  <artifact>${jackson.datatype.groupId}:*</artifact>
                   <includes>
                     <include>**</include>
                   </includes>

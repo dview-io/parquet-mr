@@ -32,6 +32,7 @@ import static org.apache.parquet.hadoop.ParquetFileWriter.MAGIC;
 import static org.apache.parquet.hadoop.ParquetFileWriter.PARQUET_COMMON_METADATA_FILE;
 import static org.apache.parquet.hadoop.ParquetFileWriter.PARQUET_METADATA_FILE;
 
+import java.io.ByteArrayInputStream;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
@@ -53,6 +54,8 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.stream.Collectors;
 import java.util.zip.CRC32;
 import org.apache.hadoop.conf.Configuration;
@@ -61,8 +64,11 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.parquet.HadoopReadOptions;
 import org.apache.parquet.ParquetReadOptions;
+import org.apache.parquet.Preconditions;
 import org.apache.parquet.bytes.ByteBufferInputStream;
+import org.apache.parquet.bytes.ByteBufferReleaser;
 import org.apache.parquet.bytes.BytesInput;
+import org.apache.parquet.bytes.ReusingByteBufferAllocator;
 import org.apache.parquet.column.ColumnDescriptor;
 import org.apache.parquet.column.page.DataPage;
 import org.apache.parquet.column.page.DataPageV1;
@@ -100,6 +106,7 @@ import org.apache.parquet.hadoop.metadata.FileMetaData;
 import org.apache.parquet.hadoop.metadata.ParquetMetadata;
 import org.apache.parquet.hadoop.util.HadoopInputFile;
 import org.apache.parquet.hadoop.util.counters.BenchmarkCounter;
+import org.apache.parquet.hadoop.util.wrapped.io.FutureIO;
 import org.apache.parquet.internal.column.columnindex.ColumnIndex;
 import org.apache.parquet.internal.column.columnindex.OffsetIndex;
 import org.apache.parquet.internal.filter2.columnindex.ColumnIndexFilter;
@@ -108,9 +115,11 @@ import org.apache.parquet.internal.filter2.columnindex.RowRanges;
 import org.apache.parquet.internal.hadoop.metadata.IndexReference;
 import org.apache.parquet.io.InputFile;
 import org.apache.parquet.io.ParquetDecodingException;
+import org.apache.parquet.io.ParquetFileRange;
 import org.apache.parquet.io.SeekableInputStream;
 import org.apache.parquet.schema.MessageType;
 import org.apache.parquet.schema.PrimitiveType;
+import org.apache.parquet.util.AutoCloseables;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -121,11 +130,14 @@ public class ParquetFileReader implements Closeable {
 
   private static final Logger LOG = LoggerFactory.getLogger(ParquetFileReader.class);
 
-  public static String PARQUET_READ_PARALLELISM = "parquet.metadata.read.parallelism";
+  public static final String PARQUET_READ_PARALLELISM = "parquet.metadata.read.parallelism";
+
+  public static final long HADOOP_VECTORED_READ_TIMEOUT_SECONDS = 300;
 
   private final ParquetMetadataConverter converter;
 
   private final CRC32 crc;
+  private final ReusingByteBufferAllocator crcAllocator;
 
   /**
    * for files provided, check if there's a summary file.
@@ -605,27 +617,32 @@ public class ParquetFileReader implements Closeable {
 
     // Read all the footer bytes in one time to avoid multiple read operations,
     // since it can be pretty time consuming for a single read operation in HDFS.
-    ByteBuffer footerBytesBuffer = ByteBuffer.allocate(fileMetadataLength);
-    f.readFully(footerBytesBuffer);
-    LOG.debug("Finished to read all footer bytes.");
-    footerBytesBuffer.flip();
-    InputStream footerBytesStream = ByteBufferInputStream.wrap(footerBytesBuffer);
+    ByteBuffer footerBytesBuffer = options.getAllocator().allocate(fileMetadataLength);
+    try {
+      f.readFully(footerBytesBuffer);
+      LOG.debug("Finished to read all footer bytes.");
+      footerBytesBuffer.flip();
+      InputStream footerBytesStream = ByteBufferInputStream.wrap(footerBytesBuffer);
 
-    // Regular file, or encrypted file with plaintext footer
-    if (!encryptedFooterMode) {
+      // Regular file, or encrypted file with plaintext footer
+      if (!encryptedFooterMode) {
+        return converter.readParquetMetadata(
+            footerBytesStream, options.getMetadataFilter(), fileDecryptor, false, fileMetadataLength);
+      }
+
+      // Encrypted file with encrypted footer
+      if (null == fileDecryptor) {
+        throw new ParquetCryptoRuntimeException("Trying to read file with encrypted footer. No keys available");
+      }
+      FileCryptoMetaData fileCryptoMetaData = readFileCryptoMetaData(footerBytesStream);
+      fileDecryptor.setFileCryptoMetaData(
+          fileCryptoMetaData.getEncryption_algorithm(), true, fileCryptoMetaData.getKey_metadata());
+      // footer length is required only for signed plaintext footers
       return converter.readParquetMetadata(
-          footerBytesStream, options.getMetadataFilter(), fileDecryptor, false, fileMetadataLength);
+          footerBytesStream, options.getMetadataFilter(), fileDecryptor, true, 0);
+    } finally {
+      options.getAllocator().release(footerBytesBuffer);
     }
-
-    // Encrypted file with encrypted footer
-    if (null == fileDecryptor) {
-      throw new ParquetCryptoRuntimeException("Trying to read file with encrypted footer. No keys available");
-    }
-    FileCryptoMetaData fileCryptoMetaData = readFileCryptoMetaData(footerBytesStream);
-    fileDecryptor.setFileCryptoMetaData(
-        fileCryptoMetaData.getEncryption_algorithm(), true, fileCryptoMetaData.getKey_metadata());
-    // footer length is required only for signed plaintext footers
-    return converter.readParquetMetadata(footerBytesStream, options.getMetadataFilter(), fileDecryptor, true, 0);
   }
 
   /**
@@ -768,7 +785,14 @@ public class ParquetFileReader implements Closeable {
     for (ColumnDescriptor col : columns) {
       paths.put(ColumnPath.get(col.getPath()), col);
     }
-    this.crc = options.usePageChecksumVerification() ? new CRC32() : null;
+
+    if (options.usePageChecksumVerification()) {
+      this.crc = new CRC32();
+      this.crcAllocator = ReusingByteBufferAllocator.strict(options.getAllocator());
+    } else {
+      this.crc = null;
+      this.crcAllocator = null;
+    }
   }
 
   /**
@@ -820,7 +844,14 @@ public class ParquetFileReader implements Closeable {
     for (ColumnDescriptor col : footer.getFileMetaData().getSchema().getColumns()) {
       paths.put(ColumnPath.get(col.getPath()), col);
     }
-    this.crc = options.usePageChecksumVerification() ? new CRC32() : null;
+
+    if (options.usePageChecksumVerification()) {
+      this.crc = new CRC32();
+      this.crcAllocator = ReusingByteBufferAllocator.strict(options.getAllocator());
+    } else {
+      this.crc = null;
+      this.crcAllocator = null;
+    }
   }
 
   /**
@@ -852,7 +883,14 @@ public class ParquetFileReader implements Closeable {
     for (ColumnDescriptor col : footer.getFileMetaData().getSchema().getColumns()) {
       paths.put(ColumnPath.get(col.getPath()), col);
     }
-    this.crc = options.usePageChecksumVerification() ? new CRC32() : null;
+
+    if (options.usePageChecksumVerification()) {
+      this.crc = new CRC32();
+      this.crcAllocator = ReusingByteBufferAllocator.strict(options.getAllocator());
+    } else {
+      this.crc = null;
+      this.crcAllocator = null;
+    }
   }
 
   public ParquetFileReader(InputFile file, ParquetReadOptions options) throws IOException {
@@ -887,7 +925,14 @@ public class ParquetFileReader implements Closeable {
     for (ColumnDescriptor col : footer.getFileMetaData().getSchema().getColumns()) {
       paths.put(ColumnPath.get(col.getPath()), col);
     }
-    this.crc = options.usePageChecksumVerification() ? new CRC32() : null;
+
+    if (options.usePageChecksumVerification()) {
+      this.crc = new CRC32();
+      this.crcAllocator = ReusingByteBufferAllocator.strict(options.getAllocator());
+    } else {
+      this.crc = null;
+      this.crcAllocator = null;
+    }
   }
 
   private static <T> List<T> listWithNulls(int size) {
@@ -1053,9 +1098,8 @@ public class ParquetFileReader implements Closeable {
     }
     // actually read all the chunks
     ChunkListBuilder builder = new ChunkListBuilder(block.getRowCount());
-    for (ConsecutivePartList consecutiveChunks : allParts) {
-      consecutiveChunks.readAll(f, builder);
-    }
+    readAllPartsVectoredOrNormal(allParts, builder);
+    rowGroup.setReleaser(builder.releaser);
     for (Chunk chunk : builder.build()) {
       readChunkPages(chunk, block, rowGroup);
     }
@@ -1130,6 +1174,108 @@ public class ParquetFileReader implements Closeable {
     }
 
     return internalReadFilteredRowGroup(block, rowRanges, getColumnIndexStore(blockIndex));
+  }
+
+  /**
+   * Read data in all parts via either vectored IO or serial IO.
+   * @param allParts all parts to be read.
+   * @param builder used to build chunk list to read the pages for the different columns.
+   * @throws IOException any IOE.
+   */
+  private void readAllPartsVectoredOrNormal(List<ConsecutivePartList> allParts, ChunkListBuilder builder)
+      throws IOException {
+
+    if (shouldUseVectoredIo(allParts)) {
+      try {
+        readVectored(allParts, builder);
+        return;
+      } catch (IllegalArgumentException | UnsupportedOperationException e) {
+        // Either the arguments are wrong or somehow this is being invoked against
+        // a hadoop release which doesn't have the API and yet somehow it got here.
+        LOG.warn("readVectored() failed; falling back to normal IO against {}", f, e);
+      }
+    }
+    for (ConsecutivePartList consecutiveChunks : allParts) {
+      consecutiveChunks.readAll(f, builder);
+    }
+  }
+
+  /**
+   * Should the read use vectored IO?
+   * <p>
+   * This returns true if all necessary conditions are met:
+   * <ol>
+   *   <li> The option is enabled</li>
+   *   <li> The Hadoop version supports vectored IO</li>
+   *   <li> The part lengths are all valid for vectored IO</li>
+   *   <li> The stream implementation explicitly supports the API; for other streams the classic
+   *         API is always used.</li>
+   *   <li> The allocator is not direct. This is to avoid HADOOP-19101 surfacing.
+   * </ol>
+   * @param allParts all parts to read.
+   * @return true or false.
+   */
+  private boolean shouldUseVectoredIo(final List<ConsecutivePartList> allParts) {
+    return options.useHadoopVectoredIo()
+        && f.readVectoredAvailable(options.getAllocator())
+        && arePartsValidForVectoredIo(allParts);
+  }
+
+  /**
+   * Validate the parts for vectored IO.
+   * Vectored IO doesn't support reading ranges of size greater than
+   * Integer.MAX_VALUE.
+   * @param allParts all parts to read.
+   * @return true or false.
+   */
+  private boolean arePartsValidForVectoredIo(List<ConsecutivePartList> allParts) {
+    for (ConsecutivePartList consecutivePart : allParts) {
+      if (consecutivePart.length >= Integer.MAX_VALUE) {
+        LOG.debug(
+            "Part length {} greater than Integer.MAX_VALUE thus disabling vectored IO",
+            consecutivePart.length);
+        return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * Read all parts through vectored IO.
+   * <p>
+   * The API is available in recent hadoop builds for all implementations of PositionedReadable;
+   * the default implementation simply does a sequence of reads at different offsets.
+   * <p>
+   * If directly implemented by a Filesystem then it is likely to be a more efficient
+   * operation such as a scatter-gather read (native IO) or set of parallel
+   * GET requests against an object store.
+   * @param allParts all parts to be read.
+   * @param builder used to build chunk list to read the pages for the different columns.
+   * @throws IOException any IOE.
+   * @throws IllegalArgumentException arguments are invalid.
+   * @throws UnsupportedOperationException if the filesystem does not support vectored IO.
+   */
+  private void readVectored(List<ConsecutivePartList> allParts, ChunkListBuilder builder) throws IOException {
+
+    List<ParquetFileRange> ranges = new ArrayList<>(allParts.size());
+    long totalSize = 0;
+    for (ConsecutivePartList consecutiveChunks : allParts) {
+      final long len = consecutiveChunks.length;
+      Preconditions.checkArgument(
+          len < Integer.MAX_VALUE,
+          "Invalid length %s for vectored read operation. It must be less than max integer value.",
+          len);
+      ranges.add(new ParquetFileRange(consecutiveChunks.offset, (int) len));
+      totalSize += len;
+    }
+    LOG.debug("Reading {} bytes of data with vectored IO in {} ranges", totalSize, ranges.size());
+    // Request a vectored read;
+    f.readVectored(ranges, options.getAllocator());
+    int k = 0;
+    for (ConsecutivePartList consecutivePart : allParts) {
+      ParquetFileRange currRange = ranges.get(k++);
+      consecutivePart.readFromVectoredRange(currRange, builder);
+    }
   }
 
   /**
@@ -1209,10 +1355,8 @@ public class ParquetFileReader implements Closeable {
         }
       }
     }
-    // actually read all the chunks
-    for (ConsecutivePartList consecutiveChunks : allParts) {
-      consecutiveChunks.readAll(f, builder);
-    }
+    readAllPartsVectoredOrNormal(allParts, builder);
+    rowGroup.setReleaser(builder.releaser);
     for (Chunk chunk : builder.build()) {
       readChunkPages(chunk, block, rowGroup);
     }
@@ -1278,6 +1422,10 @@ public class ParquetFileReader implements Closeable {
 
     // update the current block and instantiate a dictionary reader for it
     ++currentBlock;
+
+    if (nextDictionaryReader != null) {
+      nextDictionaryReader.close();
+    }
     this.nextDictionaryReader = null;
 
     return true;
@@ -1301,11 +1449,11 @@ public class ParquetFileReader implements Closeable {
     if (blockIndex < 0 || blockIndex >= blocks.size()) {
       return null;
     }
-    return new DictionaryPageReader(this, blocks.get(blockIndex));
+    return new DictionaryPageReader(this, blocks.get(blockIndex), options.getAllocator());
   }
 
   public DictionaryPageReader getDictionaryReader(BlockMetaData block) {
-    return new DictionaryPageReader(this, block);
+    return new DictionaryPageReader(this, block, options.getAllocator());
   }
 
   /**
@@ -1382,10 +1530,7 @@ public class ParquetFileReader implements Closeable {
     int uncompressedPageSize = pageHeader.getUncompressed_page_size();
     int compressedPageSize = pageHeader.getCompressed_page_size();
 
-    byte[] dictPageBytes = new byte[compressedPageSize];
-    fin.readFully(dictPageBytes);
-
-    BytesInput bin = BytesInput.from(dictPageBytes);
+    BytesInput bin = BytesInput.from(fin, compressedPageSize);
 
     if (null != pageDecryptor) {
       bin = BytesInput.from(pageDecryptor.decrypt(bin.toByteArray(), dictionaryPageAAD));
@@ -1442,11 +1587,24 @@ public class ParquetFileReader implements Closeable {
       }
     }
 
-    // Read Bloom filter data header.
+    // Seek to Bloom filter offset.
     f.seek(bloomFilterOffset);
+
+    // Read Bloom filter length.
+    int bloomFilterLength = meta.getBloomFilterLength();
+
+    // If it is set, read Bloom filter header and bitset together.
+    // Otherwise, read Bloom filter header first and then bitset.
+    InputStream in = f;
+    if (bloomFilterLength > 0) {
+      byte[] headerAndBitSet = new byte[bloomFilterLength];
+      f.readFully(headerAndBitSet);
+      in = new ByteArrayInputStream(headerAndBitSet);
+    }
+
     BloomFilterHeader bloomFilterHeader;
     try {
-      bloomFilterHeader = Util.readBloomFilterHeader(f, bloomFilterDecryptor, bloomFilterHeaderAAD);
+      bloomFilterHeader = Util.readBloomFilterHeader(in, bloomFilterDecryptor, bloomFilterHeaderAAD);
     } catch (IOException e) {
       LOG.warn("read no bloom filter");
       return null;
@@ -1472,9 +1630,9 @@ public class ParquetFileReader implements Closeable {
     byte[] bitset;
     if (null == bloomFilterDecryptor) {
       bitset = new byte[numBytes];
-      f.readFully(bitset);
+      in.read(bitset);
     } else {
-      bitset = bloomFilterDecryptor.decrypt(f, bloomFilterBitsetAAD);
+      bitset = bloomFilterDecryptor.decrypt(in, bloomFilterBitsetAAD);
       if (bitset.length != numBytes) {
         throw new ParquetCryptoRuntimeException("Wrong length of decrypted bloom filter bitset");
       }
@@ -1553,6 +1711,7 @@ public class ParquetFileReader implements Closeable {
         f.close();
       }
     } finally {
+      AutoCloseables.uncheckedClose(nextDictionaryReader, crcAllocator);
       options.getCodecFactory().release();
     }
   }
@@ -1571,6 +1730,7 @@ public class ParquetFileReader implements Closeable {
     private ChunkDescriptor lastDescriptor;
     private final long rowCount;
     private SeekableInputStream f;
+    private final ByteBufferReleaser releaser = new ByteBufferReleaser(options.getAllocator());
 
     public ChunkListBuilder(long rowCount) {
       this.rowCount = rowCount;
@@ -1580,6 +1740,10 @@ public class ParquetFileReader implements Closeable {
       map.computeIfAbsent(descriptor, d -> new ChunkData()).buffers.addAll(buffers);
       lastDescriptor = descriptor;
       this.f = f;
+    }
+
+    void addBuffersToRelease(List<ByteBuffer> toRelease) {
+      toRelease.forEach(releaser::releaseLater);
     }
 
     void setOffsetIndex(ChunkDescriptor descriptor, OffsetIndex offsetIndex) {
@@ -1638,9 +1802,11 @@ public class ParquetFileReader implements Closeable {
      * Calculate checksum of input bytes, throw decoding exception if it does not match the provided
      * reference crc
      */
-    private void verifyCrc(int referenceCrc, byte[] bytes, String exceptionMsg) {
+    private void verifyCrc(int referenceCrc, BytesInput bytes, String exceptionMsg) {
       crc.reset();
-      crc.update(bytes);
+      try (ByteBufferReleaser releaser = crcAllocator.getReleaser()) {
+        crc.update(bytes.toByteBuffer(releaser));
+      }
       if (crc.getValue() != ((long) referenceCrc & 0xffffffffL)) {
         throw new ParquetDecodingException(exceptionMsg);
       }
@@ -1706,7 +1872,7 @@ public class ParquetFileReader implements Closeable {
             if (options.usePageChecksumVerification() && pageHeader.isSetCrc()) {
               verifyCrc(
                   pageHeader.getCrc(),
-                  pageBytes.toByteArray(),
+                  pageBytes,
                   "could not verify dictionary page integrity, CRC checksum verification failed");
             }
             DictionaryPageHeader dicHeader = pageHeader.getDictionary_page_header();
@@ -1726,7 +1892,7 @@ public class ParquetFileReader implements Closeable {
             if (options.usePageChecksumVerification() && pageHeader.isSetCrc()) {
               verifyCrc(
                   pageHeader.getCrc(),
-                  pageBytes.toByteArray(),
+                  pageBytes,
                   "could not verify page integrity, CRC checksum verification failed");
             }
             DataPageV1 dataPageV1 = new DataPageV1(
@@ -1760,7 +1926,7 @@ public class ParquetFileReader implements Closeable {
               pageBytes = BytesInput.concat(repetitionLevels, definitionLevels, values);
               verifyCrc(
                   pageHeader.getCrc(),
-                  pageBytes.toByteArray(),
+                  pageBytes,
                   "could not verify page integrity, CRC checksum verification failed");
             }
             DataPageV2 dataPageV2 = new DataPageV2(
@@ -1992,13 +2158,14 @@ public class ParquetFileReader implements Closeable {
       if (lastAllocationSize > 0) {
         buffers.add(options.getAllocator().allocate(lastAllocationSize));
       }
+      builder.addBuffersToRelease(buffers);
 
       long readStart = System.nanoTime();
       for (ByteBuffer buffer : buffers) {
         f.readFully(buffer);
         buffer.flip();
       }
-      setReadMetrics(readStart);
+      setReadMetrics(readStart, length);
 
       // report in a counter the data we just scanned
       BenchmarkCounter.incrementBytesRead(length);
@@ -2008,11 +2175,11 @@ public class ParquetFileReader implements Closeable {
       }
     }
 
-    private void setReadMetrics(long startNs) {
+    private void setReadMetrics(long startNs, long len) {
       ParquetMetricsCallback metricsCallback = options.getMetricsCallback();
       if (metricsCallback != null) {
         long totalFileReadTimeNs = Math.max(System.nanoTime() - startNs, 0);
-        double sizeInMb = ((double) length) / (1024 * 1024);
+        double sizeInMb = ((double) len) / (1024 * 1024);
         double timeInSec = ((double) totalFileReadTimeNs) / 1000_0000_0000L;
         double throughput = sizeInMb / timeInSec;
         LOG.debug(
@@ -2023,6 +2190,38 @@ public class ParquetFileReader implements Closeable {
         metricsCallback.setDuration(ParquetFileReaderMetrics.ReadTime.name(), totalFileReadTimeNs);
         metricsCallback.setValueLong(ParquetFileReaderMetrics.ReadSize.name(), length);
         metricsCallback.setValueDouble(ParquetFileReaderMetrics.ReadThroughput.name(), throughput);
+      }
+    }
+
+    /**
+     * Populate data in a parquet file range from a vectored range; will block for up
+     * to {@link #HADOOP_VECTORED_READ_TIMEOUT_SECONDS} seconds.
+     * @param currRange range to populated.
+     * @param builder used to build chunk list to read the pages for the different columns.
+     * @throws IOException if there is an error while reading from the stream, including a timeout.
+     */
+    public void readFromVectoredRange(ParquetFileRange currRange, ChunkListBuilder builder) throws IOException {
+      ByteBuffer buffer;
+      final long timeoutSeconds = HADOOP_VECTORED_READ_TIMEOUT_SECONDS;
+      long readStart = System.nanoTime();
+      try {
+        LOG.debug(
+            "Waiting for vectored read to finish for range {} with timeout {} seconds",
+            currRange,
+            timeoutSeconds);
+        buffer = FutureIO.awaitFuture(currRange.getDataReadFuture(), timeoutSeconds, TimeUnit.SECONDS);
+        setReadMetrics(readStart, currRange.getLength());
+        // report in a counter the data we just scanned
+        BenchmarkCounter.incrementBytesRead(currRange.getLength());
+      } catch (TimeoutException e) {
+        String error = String.format(
+            "Timeout while fetching result for %s with time limit %d seconds", currRange, timeoutSeconds);
+        LOG.error(error, e);
+        throw new IOException(error, e);
+      }
+      ByteBufferInputStream stream = ByteBufferInputStream.wrap(buffer);
+      for (ChunkDescriptor descriptor : chunks) {
+        builder.add(descriptor, stream.sliceBuffers(descriptor.size), f);
       }
     }
 

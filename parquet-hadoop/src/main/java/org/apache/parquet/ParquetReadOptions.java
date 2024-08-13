@@ -23,6 +23,7 @@ import static org.apache.parquet.format.converter.ParquetMetadataConverter.NO_FI
 import static org.apache.parquet.hadoop.ParquetInputFormat.BLOOM_FILTERING_ENABLED;
 import static org.apache.parquet.hadoop.ParquetInputFormat.COLUMN_INDEX_FILTERING_ENABLED;
 import static org.apache.parquet.hadoop.ParquetInputFormat.DICTIONARY_FILTERING_ENABLED;
+import static org.apache.parquet.hadoop.ParquetInputFormat.HADOOP_VECTORED_IO_ENABLED;
 import static org.apache.parquet.hadoop.ParquetInputFormat.OFF_HEAP_DECRYPT_BUFFER_ENABLED;
 import static org.apache.parquet.hadoop.ParquetInputFormat.PAGE_VERIFY_CHECKSUM_ENABLED;
 import static org.apache.parquet.hadoop.ParquetInputFormat.RECORD_FILTERING_ENABLED;
@@ -55,6 +56,7 @@ public class ParquetReadOptions {
   private static final boolean STATS_FILTERING_ENABLED_DEFAULT = true;
   private static final boolean DICTIONARY_FILTERING_ENABLED_DEFAULT = true;
   private static final boolean COLUMN_INDEX_FILTERING_ENABLED_DEFAULT = true;
+  private static final boolean HADOOP_VECTORED_IO_ENABLED_DEFAULT = false;
   private static final int ALLOCATION_SIZE_DEFAULT = 8388608; // 8MB
   private static final boolean PAGE_VERIFY_CHECKSUM_ENABLED_DEFAULT = false;
   private static final boolean BLOOM_FILTER_ENABLED_DEFAULT = true;
@@ -68,6 +70,7 @@ public class ParquetReadOptions {
   private final boolean usePageChecksumVerification;
   private final boolean useBloomFilter;
   private final boolean useOffHeapDecryptBuffer;
+  private final boolean useHadoopVectoredIo;
   private final FilterCompat.Filter recordFilter;
   private final ParquetMetadataConverter.MetadataFilter metadataFilter;
   private final CompressionCodecFactory codecFactory;
@@ -87,6 +90,7 @@ public class ParquetReadOptions {
       boolean usePageChecksumVerification,
       boolean useBloomFilter,
       boolean useOffHeapDecryptBuffer,
+      boolean useHadoopVectoredIo,
       FilterCompat.Filter recordFilter,
       ParquetMetadataConverter.MetadataFilter metadataFilter,
       CompressionCodecFactory codecFactory,
@@ -104,6 +108,7 @@ public class ParquetReadOptions {
         usePageChecksumVerification,
         useBloomFilter,
         useOffHeapDecryptBuffer,
+        useHadoopVectoredIo,
         recordFilter,
         metadataFilter,
         codecFactory,
@@ -124,6 +129,7 @@ public class ParquetReadOptions {
       boolean usePageChecksumVerification,
       boolean useBloomFilter,
       boolean useOffHeapDecryptBuffer,
+      boolean useHadoopVectoredIo,
       FilterCompat.Filter recordFilter,
       ParquetMetadataConverter.MetadataFilter metadataFilter,
       CompressionCodecFactory codecFactory,
@@ -141,6 +147,7 @@ public class ParquetReadOptions {
     this.usePageChecksumVerification = usePageChecksumVerification;
     this.useBloomFilter = useBloomFilter;
     this.useOffHeapDecryptBuffer = useOffHeapDecryptBuffer;
+    this.useHadoopVectoredIo = useHadoopVectoredIo;
     this.recordFilter = recordFilter;
     this.metadataFilter = metadataFilter;
     this.codecFactory = codecFactory;
@@ -182,6 +189,10 @@ public class ParquetReadOptions {
 
   public boolean usePageChecksumVerification() {
     return usePageChecksumVerification;
+  }
+
+  public boolean useHadoopVectoredIo() {
+    return useHadoopVectoredIo;
   }
 
   public FilterCompat.Filter getRecordFilter() {
@@ -242,6 +253,7 @@ public class ParquetReadOptions {
     protected boolean useStatsFilter = STATS_FILTERING_ENABLED_DEFAULT;
     protected boolean useDictionaryFilter = DICTIONARY_FILTERING_ENABLED_DEFAULT;
     protected boolean useRecordFilter = RECORD_FILTERING_ENABLED_DEFAULT;
+    protected boolean useHadoopVectoredIo = HADOOP_VECTORED_IO_ENABLED_DEFAULT;
     protected boolean useColumnIndexFilter = COLUMN_INDEX_FILTERING_ENABLED_DEFAULT;
     protected boolean usePageChecksumVerification = PAGE_VERIFY_CHECKSUM_ENABLED_DEFAULT;
     protected boolean useBloomFilter = BLOOM_FILTER_ENABLED_DEFAULT;
@@ -274,6 +286,7 @@ public class ParquetReadOptions {
       withCodecFactory(HadoopCodecs.newFactory(conf, 0));
       withRecordFilter(getFilter(conf));
       withMaxAllocationInBytes(conf.getInt(ALLOCATION_SIZE, 8388608));
+      withUseHadoopVectoredIo(conf.getBoolean(HADOOP_VECTORED_IO_ENABLED, HADOOP_VECTORED_IO_ENABLED_DEFAULT));
       String badRecordThresh = conf.get(BAD_RECORD_THRESHOLD_CONF_KEY);
       if (badRecordThresh != null) {
         set(BAD_RECORD_THRESHOLD_CONF_KEY, badRecordThresh);
@@ -317,6 +330,11 @@ public class ParquetReadOptions {
 
     public Builder useRecordFilter() {
       this.useRecordFilter = true;
+      return this;
+    }
+
+    public Builder withUseHadoopVectoredIo(boolean useHadoopVectoredIo) {
+      this.useHadoopVectoredIo = useHadoopVectoredIo;
       return this;
     }
 
@@ -418,6 +436,7 @@ public class ParquetReadOptions {
       useDictionaryFilter(options.useDictionaryFilter);
       useRecordFilter(options.useRecordFilter);
       withRecordFilter(options.recordFilter);
+      withUseHadoopVectoredIo(options.useHadoopVectoredIo);
       withMetadataFilter(options.metadataFilter);
       withCodecFactory(options.codecFactory);
       withAllocator(options.allocator);
@@ -449,6 +468,7 @@ public class ParquetReadOptions {
           usePageChecksumVerification,
           useBloomFilter,
           useOffHeapDecryptBuffer,
+          useHadoopVectoredIo,
           recordFilter,
           metadataFilter,
           codecFactory,

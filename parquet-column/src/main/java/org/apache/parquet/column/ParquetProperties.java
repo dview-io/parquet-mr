@@ -20,6 +20,8 @@ package org.apache.parquet.column;
 
 import static org.apache.parquet.bytes.BytesUtils.getWidthFromMaxInt;
 
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Objects;
 import java.util.OptionalDouble;
 import java.util.OptionalLong;
@@ -68,6 +70,12 @@ public class ParquetProperties {
 
   private static final int MIN_SLAB_SIZE = 64;
 
+  private enum ByteStreamSplitMode {
+    NONE,
+    FLOATING_POINT,
+    EXTENDED
+  }
+
   public enum WriterVersion {
     PARQUET_1_0("v1"),
     PARQUET_2_0("v2");
@@ -112,7 +120,8 @@ public class ParquetProperties {
   private final ColumnProperty<Integer> numBloomFilterCandidates;
   private final int pageRowCountLimit;
   private final boolean pageWriteChecksumEnabled;
-  private final boolean enableByteStreamSplit;
+  private final ColumnProperty<ByteStreamSplitMode> byteStreamSplitEnabled;
+  private final Map<String, String> extraMetaData;
 
   private ParquetProperties(Builder builder) {
     this.pageSizeThreshold = builder.pageSize;
@@ -138,7 +147,16 @@ public class ParquetProperties {
     this.numBloomFilterCandidates = builder.numBloomFilterCandidates.build();
     this.pageRowCountLimit = builder.pageRowCountLimit;
     this.pageWriteChecksumEnabled = builder.pageWriteChecksumEnabled;
-    this.enableByteStreamSplit = builder.enableByteStreamSplit;
+    this.byteStreamSplitEnabled = builder.byteStreamSplitEnabled.build();
+    this.extraMetaData = builder.extraMetaData;
+  }
+
+  public static Builder builder() {
+    return new Builder();
+  }
+
+  public static Builder copy(ParquetProperties toCopy) {
+    return new Builder(toCopy);
   }
 
   public ValuesWriter newRepetitionLevelWriter(ColumnDescriptor path) {
@@ -204,8 +222,23 @@ public class ParquetProperties {
     return dictionaryEnabled.getValue(column);
   }
 
+  @Deprecated()
   public boolean isByteStreamSplitEnabled() {
-    return enableByteStreamSplit;
+    return byteStreamSplitEnabled.getDefaultValue() != ByteStreamSplitMode.NONE;
+  }
+
+  public boolean isByteStreamSplitEnabled(ColumnDescriptor column) {
+    switch (column.getPrimitiveType().getPrimitiveTypeName()) {
+      case FLOAT:
+      case DOUBLE:
+        return byteStreamSplitEnabled.getValue(column) != ByteStreamSplitMode.NONE;
+      case INT32:
+      case INT64:
+      case FIXED_LEN_BYTE_ARRAY:
+        return byteStreamSplitEnabled.getValue(column) == ByteStreamSplitMode.EXTENDED;
+      default:
+        return false;
+    }
   }
 
   public ByteBufferAllocator getAllocator() {
@@ -293,12 +326,8 @@ public class ParquetProperties {
     return numBloomFilterCandidates.getValue(column);
   }
 
-  public static Builder builder() {
-    return new Builder();
-  }
-
-  public static Builder copy(ParquetProperties toCopy) {
-    return new Builder(toCopy);
+  public Map<String, String> getExtraMetaData() {
+    return extraMetaData;
   }
 
   @Override
@@ -341,10 +370,16 @@ public class ParquetProperties {
     private final ColumnProperty.Builder<Boolean> bloomFilterEnabled;
     private int pageRowCountLimit = DEFAULT_PAGE_ROW_COUNT_LIMIT;
     private boolean pageWriteChecksumEnabled = DEFAULT_PAGE_WRITE_CHECKSUM_ENABLED;
-    private boolean enableByteStreamSplit = DEFAULT_IS_BYTE_STREAM_SPLIT_ENABLED;
+    private final ColumnProperty.Builder<ByteStreamSplitMode> byteStreamSplitEnabled;
+    private Map<String, String> extraMetaData = new HashMap<>();
 
     private Builder() {
       enableDict = ColumnProperty.<Boolean>builder().withDefaultValue(DEFAULT_IS_DICTIONARY_ENABLED);
+      byteStreamSplitEnabled = ColumnProperty.<ByteStreamSplitMode>builder()
+          .withDefaultValue(
+              DEFAULT_IS_BYTE_STREAM_SPLIT_ENABLED
+                  ? ByteStreamSplitMode.FLOATING_POINT
+                  : ByteStreamSplitMode.NONE);
       bloomFilterEnabled = ColumnProperty.<Boolean>builder().withDefaultValue(DEFAULT_BLOOM_FILTER_ENABLED);
       bloomFilterNDVs = ColumnProperty.<Long>builder().withDefaultValue(null);
       bloomFilterFPPs = ColumnProperty.<Double>builder().withDefaultValue(DEFAULT_BLOOM_FILTER_FPP);
@@ -356,7 +391,7 @@ public class ParquetProperties {
 
     private Builder(ParquetProperties toCopy) {
       this.pageSize = toCopy.pageSizeThreshold;
-      this.enableDict = ColumnProperty.<Boolean>builder(toCopy.dictionaryEnabled);
+      this.enableDict = ColumnProperty.builder(toCopy.dictionaryEnabled);
       this.dictPageSize = toCopy.dictionaryPageSizeThreshold;
       this.writerVersion = toCopy.writerVersion;
       this.minRowCountForPageSizeCheck = toCopy.minRowCountForPageSizeCheck;
@@ -366,13 +401,14 @@ public class ParquetProperties {
       this.allocator = toCopy.allocator;
       this.pageRowCountLimit = toCopy.pageRowCountLimit;
       this.pageWriteChecksumEnabled = toCopy.pageWriteChecksumEnabled;
-      this.bloomFilterNDVs = ColumnProperty.<Long>builder(toCopy.bloomFilterNDVs);
-      this.bloomFilterFPPs = ColumnProperty.<Double>builder(toCopy.bloomFilterFPPs);
-      this.bloomFilterEnabled = ColumnProperty.<Boolean>builder(toCopy.bloomFilterEnabled);
-      this.adaptiveBloomFilterEnabled = ColumnProperty.<Boolean>builder(toCopy.adaptiveBloomFilterEnabled);
-      this.numBloomFilterCandidates = ColumnProperty.<Integer>builder(toCopy.numBloomFilterCandidates);
+      this.bloomFilterNDVs = ColumnProperty.builder(toCopy.bloomFilterNDVs);
+      this.bloomFilterFPPs = ColumnProperty.builder(toCopy.bloomFilterFPPs);
+      this.bloomFilterEnabled = ColumnProperty.builder(toCopy.bloomFilterEnabled);
+      this.adaptiveBloomFilterEnabled = ColumnProperty.builder(toCopy.adaptiveBloomFilterEnabled);
+      this.numBloomFilterCandidates = ColumnProperty.builder(toCopy.numBloomFilterCandidates);
       this.maxBloomFilterBytes = toCopy.maxBloomFilterBytes;
-      this.enableByteStreamSplit = toCopy.enableByteStreamSplit;
+      this.byteStreamSplitEnabled = ColumnProperty.builder(toCopy.byteStreamSplitEnabled);
+      this.extraMetaData = toCopy.extraMetaData;
     }
 
     /**
@@ -410,8 +446,40 @@ public class ParquetProperties {
       return this;
     }
 
-    public Builder withByteStreamSplitEncoding(boolean enableByteStreamSplit) {
-      this.enableByteStreamSplit = enableByteStreamSplit;
+    /**
+     * Enable or disable BYTE_STREAM_SPLIT encoding for FLOAT and DOUBLE columns.
+     *
+     * @param enable whether BYTE_STREAM_SPLIT encoding should be enabled
+     * @return this builder for method chaining.
+     */
+    public Builder withByteStreamSplitEncoding(boolean enable) {
+      this.byteStreamSplitEnabled.withDefaultValue(
+          enable ? ByteStreamSplitMode.FLOATING_POINT : ByteStreamSplitMode.NONE);
+      return this;
+    }
+
+    /**
+     * Enable or disable BYTE_STREAM_SPLIT encoding for specified columns.
+     *
+     * @param columnPath the path of the column (dot-string)
+     * @param enable     whether BYTE_STREAM_SPLIT encoding should be enabled
+     * @return this builder for method chaining.
+     */
+    public Builder withByteStreamSplitEncoding(String columnPath, boolean enable) {
+      this.byteStreamSplitEnabled.withValue(
+          columnPath, enable ? ByteStreamSplitMode.EXTENDED : ByteStreamSplitMode.NONE);
+      return this;
+    }
+
+    /**
+     * Enable or disable BYTE_STREAM_SPLIT encoding for FLOAT, DOUBLE, INT32, INT64 and FIXED_LEN_BYTE_ARRAY columns.
+     *
+     * @param enable whether BYTE_STREAM_SPLIT encoding should be enabled
+     * @return this builder for method chaining.
+     */
+    public Builder withExtendedByteStreamSplitEncoding(boolean enable) {
+      this.byteStreamSplitEnabled.withDefaultValue(
+          enable ? ByteStreamSplitMode.EXTENDED : ByteStreamSplitMode.NONE);
       return this;
     }
 
@@ -581,6 +649,11 @@ public class ParquetProperties {
 
     public Builder withPageWriteChecksumEnabled(boolean val) {
       this.pageWriteChecksumEnabled = val;
+      return this;
+    }
+
+    public Builder withExtraMetaData(Map<String, String> extraMetaData) {
+      this.extraMetaData = extraMetaData;
       return this;
     }
 

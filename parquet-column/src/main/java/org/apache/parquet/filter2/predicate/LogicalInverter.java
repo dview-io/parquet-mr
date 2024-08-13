@@ -21,6 +21,7 @@ package org.apache.parquet.filter2.predicate;
 import java.util.Objects;
 import org.apache.parquet.filter2.predicate.FilterPredicate.Visitor;
 import org.apache.parquet.filter2.predicate.Operators.And;
+import org.apache.parquet.filter2.predicate.Operators.Contains;
 import org.apache.parquet.filter2.predicate.Operators.Eq;
 import org.apache.parquet.filter2.predicate.Operators.Gt;
 import org.apache.parquet.filter2.predicate.Operators.GtEq;
@@ -90,6 +91,11 @@ public final class LogicalInverter implements Visitor<FilterPredicate> {
   @Override
   public <T extends Comparable<T>> FilterPredicate visit(NotIn<T> notIn) {
     return new In<>(notIn.getColumn(), notIn.getValues());
+  }
+
+  @Override
+  public <T extends Comparable<T>> FilterPredicate visit(Contains<T> contains) {
+    return contains.not();
   }
 
   @Override

@@ -23,8 +23,11 @@ import static org.apache.parquet.column.Encoding.BIT_PACKED;
 import static org.apache.parquet.column.Encoding.PLAIN;
 import static org.apache.parquet.column.Encoding.RLE_DICTIONARY;
 import static org.apache.parquet.format.converter.ParquetMetadataConverter.MAX_STATS_SIZE;
+import static org.apache.parquet.hadoop.ParquetFileWriter.Mode.CREATE;
 import static org.apache.parquet.hadoop.ParquetFileWriter.Mode.OVERWRITE;
 import static org.apache.parquet.hadoop.ParquetInputFormat.READ_SUPPORT_CLASS;
+import static org.apache.parquet.hadoop.ParquetWriter.DEFAULT_BLOCK_SIZE;
+import static org.apache.parquet.hadoop.ParquetWriter.MAX_PADDING_SIZE_DEFAULT;
 import static org.apache.parquet.hadoop.TestUtils.enforceEmptyDir;
 import static org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName.BINARY;
 import static org.apache.parquet.schema.Type.Repetition.OPTIONAL;
@@ -33,6 +36,7 @@ import static org.apache.parquet.schema.Type.Repetition.REQUIRED;
 import static org.junit.Assert.assertArrayEquals;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -61,8 +65,11 @@ import org.apache.parquet.ParquetReadOptions;
 import org.apache.parquet.Version;
 import org.apache.parquet.bytes.BytesInput;
 import org.apache.parquet.bytes.BytesUtils;
+import org.apache.parquet.bytes.HeapByteBufferAllocator;
+import org.apache.parquet.bytes.TrackingByteBufferAllocator;
 import org.apache.parquet.column.ColumnDescriptor;
 import org.apache.parquet.column.Encoding;
+import org.apache.parquet.column.ParquetProperties;
 import org.apache.parquet.column.page.DataPage;
 import org.apache.parquet.column.page.DataPageV1;
 import org.apache.parquet.column.page.DataPageV2;
@@ -89,7 +96,9 @@ import org.apache.parquet.hadoop.metadata.ParquetMetadata;
 import org.apache.parquet.hadoop.metadata.StrictKeyValueMetadataMergeStrategy;
 import org.apache.parquet.hadoop.util.ContextUtil;
 import org.apache.parquet.hadoop.util.HadoopInputFile;
+import org.apache.parquet.hadoop.util.HadoopOutputFile;
 import org.apache.parquet.hadoop.util.HiddenFileFilter;
+import org.apache.parquet.internal.column.columnindex.BinaryTruncator;
 import org.apache.parquet.internal.column.columnindex.BoundaryOrder;
 import org.apache.parquet.internal.column.columnindex.ColumnIndex;
 import org.apache.parquet.internal.column.columnindex.OffsetIndex;
@@ -100,14 +109,25 @@ import org.apache.parquet.schema.MessageTypeParser;
 import org.apache.parquet.schema.PrimitiveType;
 import org.apache.parquet.schema.PrimitiveType.PrimitiveTypeName;
 import org.apache.parquet.schema.Types;
+import org.junit.After;
 import org.junit.Assume;
+import org.junit.Before;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 import org.mockito.Mockito;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+/**
+ * Verify that data can be written and read back again.
+ * The test suite is parameterized on vector IO being disabled/enabled.
+ * This verifies that the vector IO code path is correct, and that
+ * the default path continues to work.
+ */
+@RunWith(Parameterized.class)
 public class TestParquetFileWriter {
 
   private static final Logger LOG = LoggerFactory.getLogger(TestParquetFileWriter.class);
@@ -141,6 +161,68 @@ public class TestParquetFileWriter {
   @Rule
   public final TemporaryFolder temp = new TemporaryFolder();
 
+  @Parameterized.Parameters(name = "vectored : {0}")
+  public static List<Boolean> params() {
+    return Arrays.asList(true, false);
+  }
+
+  /**
+   * Read type: true for vectored IO.
+   */
+  private final boolean vectoredRead;
+
+  /**
+   * Instantiate.
+   * @param vectoredRead use vector IO for reading.
+   */
+  public TestParquetFileWriter(boolean vectoredRead) {
+    this.vectoredRead = vectoredRead;
+  }
+
+  /**
+   * Get the configuration for the tests.
+   * @return a configuration which may have vector IO set.
+   */
+  private Configuration getTestConfiguration() {
+    Configuration conf = new Configuration();
+    // set the vector IO option
+    conf.setBoolean(ParquetInputFormat.HADOOP_VECTORED_IO_ENABLED, vectoredRead);
+    return conf;
+  }
+
+  private TrackingByteBufferAllocator allocator;
+
+  @Before
+  public void initAllocator() {
+    allocator = TrackingByteBufferAllocator.wrap(new HeapByteBufferAllocator());
+  }
+
+  @After
+  public void closeAllocator() {
+    allocator.close();
+  }
+
+  private ParquetFileWriter createWriter(Configuration conf, MessageType schema, Path path) throws IOException {
+    return createWriter(conf, schema, path, CREATE);
+  }
+
+  private ParquetFileWriter createWriter(
+      Configuration conf, MessageType schema, Path path, ParquetFileWriter.Mode mode) throws IOException {
+    return new ParquetFileWriter(
+        HadoopOutputFile.fromPath(path, conf),
+        schema,
+        mode,
+        DEFAULT_BLOCK_SIZE,
+        MAX_PADDING_SIZE_DEFAULT,
+        null,
+        ParquetProperties.builder().withAllocator(allocator).build());
+  }
+
+  private ParquetFileWriter createWriter(
+      Configuration conf, MessageType schema, Path path, long blockSize, int maxPaddingSize) throws IOException {
+    return new ParquetFileWriter(conf, schema, path, blockSize, maxPaddingSize, Integer.MAX_VALUE, allocator);
+  }
+
   @Test
   public void testWriteMode() throws Exception {
     File testFile = temp.newFile();
@@ -152,14 +234,14 @@ public class TestParquetFileWriter {
     boolean exceptionThrown = false;
     Path path = new Path(testFile.toURI());
     try {
-      writer = new ParquetFileWriter(conf, schema, path, ParquetFileWriter.Mode.CREATE);
+      writer = createWriter(conf, schema, path);
     } catch (IOException ioe1) {
       exceptionThrown = true;
     }
     assertTrue(exceptionThrown);
     exceptionThrown = false;
     try {
-      writer = new ParquetFileWriter(conf, schema, path, OVERWRITE);
+      writer = createWriter(conf, schema, path, OVERWRITE);
     } catch (IOException ioe2) {
       exceptionThrown = true;
     }
@@ -173,9 +255,9 @@ public class TestParquetFileWriter {
     testFile.delete();
 
     Path path = new Path(testFile.toURI());
-    Configuration configuration = new Configuration();
+    Configuration configuration = getTestConfiguration();
 
-    ParquetFileWriter w = new ParquetFileWriter(configuration, SCHEMA, path);
+    ParquetFileWriter w = createWriter(configuration, SCHEMA, path);
     w.start();
     w.startBlock(3);
     w.startColumn(C1, 5, CODEC);
@@ -204,6 +286,9 @@ public class TestParquetFileWriter {
     w.endColumn();
     w.endBlock();
     w.end(new HashMap<String, String>());
+    // Although writer is already closed in previous end(),
+    // explicitly close it again to verify double close behavior.
+    w.close();
 
     ParquetMetadata readFooter = ParquetFileReader.readFooter(configuration, path);
     assertEquals("footer: " + readFooter, 2, readFooter.getBlocks().size());
@@ -273,9 +358,9 @@ public class TestParquetFileWriter {
     testFile.delete();
 
     Path path = new Path(testFile.toURI());
-    Configuration configuration = new Configuration();
+    Configuration configuration = getTestConfiguration();
 
-    ParquetFileWriter w = new ParquetFileWriter(configuration, SCHEMA, path);
+    ParquetFileWriter w = createWriter(configuration, SCHEMA, path);
     w.start();
     w.startBlock(3);
     w.startColumn(C1, 5, CODEC);
@@ -355,7 +440,7 @@ public class TestParquetFileWriter {
     Path path = new Path(testFile.toURI());
     Configuration configuration = new Configuration();
 
-    ParquetFileWriter w = new ParquetFileWriter(configuration, SCHEMA, path);
+    ParquetFileWriter w = createWriter(configuration, SCHEMA, path);
     w.start();
     w.startBlock(0);
 
@@ -371,12 +456,12 @@ public class TestParquetFileWriter {
     File testFile = temp.newFile();
     testFile.delete();
     Path path = new Path(testFile.toURI());
-    Configuration configuration = new Configuration();
+    Configuration configuration = getTestConfiguration();
     configuration.set("parquet.bloom.filter.column.names", "foo");
     String[] colPath = {"foo"};
     ColumnDescriptor col = schema.getColumnDescription(colPath);
     BinaryStatistics stats1 = new BinaryStatistics();
-    ParquetFileWriter w = new ParquetFileWriter(configuration, schema, path);
+    ParquetFileWriter w = createWriter(configuration, schema, path);
     w.start();
     w.startBlock(3);
     w.startColumn(col, 5, CODEC);
@@ -412,9 +497,9 @@ public class TestParquetFileWriter {
     testFile.delete();
 
     Path path = new Path(testFile.toURI());
-    Configuration configuration = new Configuration();
+    Configuration configuration = getTestConfiguration();
 
-    ParquetFileWriter w = new ParquetFileWriter(configuration, SCHEMA, path);
+    ParquetFileWriter w = createWriter(configuration, SCHEMA, path);
     w.start();
     w.startBlock(14);
 
@@ -525,12 +610,12 @@ public class TestParquetFileWriter {
     File testFile = temp.newFile();
 
     Path path = new Path(testFile.toURI());
-    Configuration conf = new Configuration();
+    Configuration conf = getTestConfiguration();
     // Disable writing out checksums as hardcoded byte offsets in assertions below expect it
     conf.setBoolean(ParquetOutputFormat.PAGE_WRITE_CHECKSUM_ENABLED, false);
 
     // uses the test constructor
-    ParquetFileWriter w = new ParquetFileWriter(conf, SCHEMA, path, 120, 60);
+    ParquetFileWriter w = createWriter(conf, SCHEMA, path, 120, 60);
 
     w.start();
     w.startBlock(3);
@@ -567,9 +652,11 @@ public class TestParquetFileWriter {
     FileSystem fs = path.getFileSystem(conf);
     long fileLen = fs.getFileStatus(path).getLen();
 
-    FSDataInputStream data = fs.open(path);
-    data.seek(fileLen - 8); // 4-byte offset + "PAR1"
-    long footerLen = BytesUtils.readIntLittleEndian(data);
+    long footerLen;
+    try (FSDataInputStream data = fs.open(path)) {
+      data.seek(fileLen - 8); // 4-byte offset + "PAR1"
+      footerLen = BytesUtils.readIntLittleEndian(data);
+    }
     long startFooter = fileLen - footerLen - 8;
 
     assertEquals("Footer should start after second row group without padding", secondRowGroupEnds, startFooter);
@@ -649,12 +736,14 @@ public class TestParquetFileWriter {
     File testFile = temp.newFile();
 
     Path path = new Path(testFile.toURI());
-    Configuration conf = new Configuration();
+    Configuration conf = getTestConfiguration();
     // Disable writing out checksums as hardcoded byte offsets in assertions below expect it
     conf.setBoolean(ParquetOutputFormat.PAGE_WRITE_CHECKSUM_ENABLED, false);
+    // close any filesystems to ensure that the the FS used by the writer picks up the configuration
+    FileSystem.closeAll();
 
     // uses the test constructor
-    ParquetFileWriter w = new ParquetFileWriter(conf, SCHEMA, path, 100, 50);
+    ParquetFileWriter w = createWriter(conf, SCHEMA, path, 100, 50);
 
     w.start();
     w.startBlock(3);
@@ -691,9 +780,11 @@ public class TestParquetFileWriter {
     FileSystem fs = path.getFileSystem(conf);
     long fileLen = fs.getFileStatus(path).getLen();
 
-    FSDataInputStream data = fs.open(path);
-    data.seek(fileLen - 8); // 4-byte offset + "PAR1"
-    long footerLen = BytesUtils.readIntLittleEndian(data);
+    long footerLen;
+    try (FSDataInputStream data = fs.open(path)) {
+      data.seek(fileLen - 8); // 4-byte offset + "PAR1"
+      footerLen = BytesUtils.readIntLittleEndian(data);
+    }
     long startFooter = fileLen - footerLen - 8;
 
     assertEquals("Footer should start after second row group without padding", secondRowGroupEnds, startFooter);
@@ -798,7 +889,7 @@ public class TestParquetFileWriter {
     testFile.delete();
 
     Path path = new Path(testFile.toURI());
-    Configuration configuration = new Configuration();
+    Configuration configuration = getTestConfiguration();
     configuration.setBoolean("parquet.strings.signed-min-max.enabled", true);
 
     MessageType schema = MessageTypeParser.parseMessageType(
@@ -827,7 +918,7 @@ public class TestParquetFileWriter {
     statsB2C1P1.setMinMax(Binary.fromString("d"), Binary.fromString("e"));
     statsB2C2P1.setMinMax(11l, 122l);
 
-    ParquetFileWriter w = new ParquetFileWriter(configuration, schema, path);
+    ParquetFileWriter w = createWriter(configuration, schema, path);
     w.start();
     w.startBlock(3);
     w.startColumn(c1, 5, codec);
@@ -892,7 +983,7 @@ public class TestParquetFileWriter {
     File testDir = temp.newFolder();
 
     Path testDirPath = new Path(testDir.toURI());
-    Configuration configuration = new Configuration();
+    Configuration configuration = getTestConfiguration();
 
     final FileSystem fs = testDirPath.getFileSystem(configuration);
     enforceEmptyDir(configuration, testDirPath);
@@ -946,10 +1037,12 @@ public class TestParquetFileWriter {
     Path path = new Path(testFile.toURI());
 
     MessageType schema = MessageTypeParser.parseMessageType(writeSchema);
-    Configuration configuration = new Configuration();
+    Configuration configuration = getTestConfiguration();
     configuration.setBoolean("parquet.strings.signed-min-max.enabled", true);
     GroupWriteSupport.setSchema(schema, configuration);
 
+    // close any filesystems to ensure that the the FS used by the writer picks up the configuration
+    FileSystem.closeAll();
     ParquetWriter<Group> writer = new ParquetWriter<Group>(path, configuration, new GroupWriteSupport());
 
     Group r1 = new SimpleGroup(schema);
@@ -999,7 +1092,7 @@ public class TestParquetFileWriter {
     BinaryStatistics stats1 = new BinaryStatistics();
     BinaryStatistics stats2 = new BinaryStatistics();
 
-    ParquetFileWriter w = new ParquetFileWriter(configuration, schema, path);
+    ParquetFileWriter w = createWriter(configuration, schema, path);
     w.start();
     w.startBlock(3);
     w.startColumn(c1, 5, codec);
@@ -1142,7 +1235,7 @@ public class TestParquetFileWriter {
    */
   @Test
   public void testWriteMetadataFileWithRelativeOutputPath() throws IOException {
-    Configuration conf = new Configuration();
+    Configuration conf = getTestConfiguration();
     FileSystem fs = FileSystem.get(conf);
     Path relativeRoot = new Path("target/_test_relative");
     Path qualifiedRoot = fs.makeQualified(relativeRoot);
@@ -1164,13 +1257,27 @@ public class TestParquetFileWriter {
 
   @Test
   public void testColumnIndexWriteRead() throws Exception {
+    // Don't truncate
+    testColumnIndexWriteRead(Integer.MAX_VALUE);
+    // Truncate to DEFAULT_COLUMN_INDEX_TRUNCATE_LENGTH
+    testColumnIndexWriteRead(ParquetProperties.DEFAULT_COLUMN_INDEX_TRUNCATE_LENGTH);
+  }
+
+  private void testColumnIndexWriteRead(int columnIndexTruncateLen) throws Exception {
     File testFile = temp.newFile();
     testFile.delete();
 
     Path path = new Path(testFile.toURI());
-    Configuration configuration = new Configuration();
+    Configuration configuration = getTestConfiguration();
 
-    ParquetFileWriter w = new ParquetFileWriter(configuration, SCHEMA, path);
+    ParquetFileWriter w = new ParquetFileWriter(
+        configuration,
+        SCHEMA,
+        path,
+        DEFAULT_BLOCK_SIZE,
+        MAX_PADDING_SIZE_DEFAULT,
+        columnIndexTruncateLen,
+        allocator);
     w.start();
     w.startBlock(4);
     w.startColumn(C1, 7, CODEC);
@@ -1294,8 +1401,36 @@ public class TestParquetFileWriter {
       assertEquals(1, offsetIndex.getFirstRowIndex(1));
       assertEquals(3, offsetIndex.getFirstRowIndex(2));
 
-      assertNull(reader.readColumnIndex(
-          footer.getBlocks().get(2).getColumns().get(0)));
+      if (columnIndexTruncateLen == Integer.MAX_VALUE) {
+        assertNull(reader.readColumnIndex(
+            footer.getBlocks().get(2).getColumns().get(0)));
+      } else {
+        blockMeta = footer.getBlocks().get(2);
+        assertNotNull(reader.readColumnIndex(blockMeta.getColumns().get(0)));
+        columnIndex = reader.readColumnIndex(blockMeta.getColumns().get(0));
+        assertEquals(BoundaryOrder.ASCENDING, columnIndex.getBoundaryOrder());
+        assertTrue(Arrays.asList(0l).equals(columnIndex.getNullCounts()));
+        assertTrue(Arrays.asList(false).equals(columnIndex.getNullPages()));
+        minValues = columnIndex.getMinValues();
+        assertEquals(1, minValues.size());
+        maxValues = columnIndex.getMaxValues();
+        assertEquals(1, maxValues.size());
+
+        BinaryTruncator truncator =
+            BinaryTruncator.getTruncator(SCHEMA.getType(PATH1).asPrimitiveType());
+        assertEquals(
+            new String(new byte[1], StandardCharsets.UTF_8),
+            new String(minValues.get(0).array(), StandardCharsets.UTF_8));
+        byte[] truncatedMaxValue = truncator
+            .truncateMax(
+                Binary.fromConstantByteArray(new byte[(int) MAX_STATS_SIZE]), columnIndexTruncateLen)
+            .getBytes();
+        assertEquals(
+            new String(truncatedMaxValue, StandardCharsets.UTF_8),
+            new String(maxValues.get(0).array(), StandardCharsets.UTF_8));
+
+        assertNull(reader.readColumnIndex(blockMeta.getColumns().get(1)));
+      }
     }
   }
 

@@ -20,7 +20,6 @@ package org.apache.parquet.avro;
 
 import static java.util.Optional.empty;
 import static java.util.Optional.of;
-import static org.apache.avro.JsonProperties.NULL_VALUE;
 import static org.apache.parquet.avro.AvroReadSupport.READ_INT96_AS_FIXED;
 import static org.apache.parquet.avro.AvroReadSupport.READ_INT96_AS_FIXED_DEFAULT;
 import static org.apache.parquet.avro.AvroWriteSupport.WRITE_FIXED_AS_INT96;
@@ -58,6 +57,7 @@ import java.util.Set;
 import org.apache.avro.LogicalType;
 import org.apache.avro.LogicalTypes;
 import org.apache.avro.Schema;
+import org.apache.avro.SchemaBuilder;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.parquet.conf.HadoopParquetConfiguration;
 import org.apache.parquet.conf.ParquetConfiguration;
@@ -296,22 +296,24 @@ public class AvroSchemaConverter {
   }
 
   private Schema convertFields(String name, List<Type> parquetFields, Map<String, Integer> names) {
-    List<Schema.Field> fields = new ArrayList<Schema.Field>();
-    Integer nameCount = names.merge(name, 1, (oldValue, value) -> oldValue + 1);
+    SchemaBuilder.FieldAssembler<Schema> builder =
+        SchemaBuilder.builder(namespace(name, names)).record(name).fields();
     for (Type parquetType : parquetFields) {
       Schema fieldSchema = convertField(parquetType, names);
-      if (parquetType.isRepetition(REPEATED)) {
-        throw new UnsupportedOperationException(
-            "REPEATED not supported outside LIST or MAP. Type: " + parquetType);
+      if (parquetType.isRepetition(REPEATED)) { // If a repeated field is ungrouped, treat as REQUIRED per spec
+        builder.name(parquetType.getName())
+            .type()
+            .array()
+            .items()
+            .type(fieldSchema)
+            .arrayDefault(new ArrayList<>());
       } else if (parquetType.isRepetition(Type.Repetition.OPTIONAL)) {
-        fields.add(new Schema.Field(parquetType.getName(), optional(fieldSchema), null, NULL_VALUE));
+        builder.name(parquetType.getName()).type().optional().type(fieldSchema);
       } else { // REQUIRED
-        fields.add(new Schema.Field(parquetType.getName(), fieldSchema, null, (Object) null));
+        builder.name(parquetType.getName()).type(fieldSchema).noDefault();
       }
     }
-    Schema schema = Schema.createRecord(name, null, nameCount > 1 ? name + nameCount : null, false);
-    schema.setFields(fields);
-    return schema;
+    return builder.endRecord();
   }
 
   private Schema convertField(final Type parquetType, Map<String, Integer> names) {
@@ -361,7 +363,9 @@ public class AvroSchemaConverter {
                 return Schema.create(Schema.Type.STRING);
               } else {
                 int size = parquetType.asPrimitiveType().getTypeLength();
-                return Schema.createFixed(parquetType.getName(), null, null, size);
+                String name = parquetType.getName();
+                String ns = namespace(name, names);
+                return Schema.createFixed(name, null, ns, size);
               }
             }
 
@@ -595,5 +599,10 @@ public class AvroSchemaConverter {
       return fieldName;
     }
     return path + '.' + fieldName;
+  }
+
+  private static String namespace(String name, Map<String, Integer> names) {
+    Integer nameCount = names.merge(name, 1, (oldValue, value) -> oldValue + 1);
+    return nameCount > 1 ? name + nameCount : null;
   }
 }

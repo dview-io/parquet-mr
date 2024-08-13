@@ -20,6 +20,7 @@ package org.apache.parquet.filter2.predicate;
 
 import static org.apache.parquet.filter2.predicate.FilterApi.and;
 import static org.apache.parquet.filter2.predicate.FilterApi.binaryColumn;
+import static org.apache.parquet.filter2.predicate.FilterApi.contains;
 import static org.apache.parquet.filter2.predicate.FilterApi.doubleColumn;
 import static org.apache.parquet.filter2.predicate.FilterApi.eq;
 import static org.apache.parquet.filter2.predicate.FilterApi.gt;
@@ -31,6 +32,7 @@ import static org.apache.parquet.filter2.predicate.FilterApi.or;
 import static org.apache.parquet.filter2.predicate.FilterApi.userDefined;
 import static org.apache.parquet.filter2.predicate.Operators.NotEq;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 import java.io.ByteArrayInputStream;
@@ -92,11 +94,50 @@ public class TestFilterApiMethods {
   }
 
   @Test
+  public void testContainsCreation() {
+    assertThrows(
+        "Contains predicate does not support null element value",
+        IllegalArgumentException.class,
+        () -> contains(eq(binColumn, null)));
+
+    // Assert that a single Contains predicate referencing multiple columns throws an error
+    assertThrows(
+        "Composed Contains predicates must reference the same column name; found [a.b.c, b.c.d]",
+        IllegalArgumentException.class,
+        () -> contains(eq(binaryColumn("a.b.c"), Binary.fromString("foo")))
+            .and(contains(eq(binaryColumn("b.c.d"), Binary.fromString("bar"))))
+            .and(contains(eq(binaryColumn("b.c.d"), Binary.fromString("bar")))));
+
+    // Assert that a Contains predicate referencing multiple columns is allowed when composed with and() or or()
+    final FilterPredicate rewritten = ContainsRewriter.rewrite(or(
+        contains(eq(binaryColumn("a.b.c"), Binary.fromString("foo"))),
+        and(
+            contains(eq(binaryColumn("b.c.d"), Binary.fromString("bar"))),
+            contains(eq(binaryColumn("b.c.d"), Binary.fromString("baz"))))));
+    assertTrue(rewritten instanceof Or);
+
+    // Assert that the predicates for column b.c.d have been combined into a single Contains predicate,
+    // while the predicate for column a.b.c is separate
+    final Or or = (Or) rewritten;
+    assertEquals(binaryColumn("a.b.c"), ((Operators.Contains) or.getLeft()).getColumn());
+    assertEquals(binaryColumn("b.c.d"), ((Operators.Contains) or.getRight()).getColumn());
+  }
+
+  @Test
   public void testToString() {
     FilterPredicate pred = or(predicate, notEq(binColumn, Binary.fromString("foobarbaz")));
     assertEquals(
         "or(and(not(or(eq(a.b.c, 7), noteq(a.b.c, 17))), gt(x.y.z, 100.0)), "
             + "noteq(a.string.column, Binary{\"foobarbaz\"}))",
+        pred.toString());
+
+    pred = ContainsRewriter.rewrite(or(
+        contains(eq(binColumn, Binary.fromString("foo"))),
+        and(
+            contains(eq(binColumn, Binary.fromString("bar"))),
+            not(contains(eq(binColumn, Binary.fromString("baz")))))));
+    assertEquals(
+        "or(contains(eq(a.string.column, Binary{\"foo\"})), and(contains(eq(a.string.column, Binary{\"bar\"})), not(contains(eq(a.string.column, Binary{\"baz\"})))))",
         pred.toString());
   }
 

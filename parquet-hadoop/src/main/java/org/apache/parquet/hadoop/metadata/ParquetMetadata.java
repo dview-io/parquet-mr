@@ -19,13 +19,14 @@
 package org.apache.parquet.hadoop.metadata;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.ObjectWriter;
 import java.io.IOException;
 import java.io.StringReader;
 import java.io.StringWriter;
 import java.util.List;
 
 /**
- * Meta Data block stored in the footer of the file
+ * Metadata block stored in the footer of the file
  * contains file level (Codec, Schema, ...) and block level (location, columns, record count, ...) meta data
  */
 public class ParquetMetadata {
@@ -50,19 +51,23 @@ public class ParquetMetadata {
 
   private static String toJSON(ParquetMetadata parquetMetaData, boolean isPrettyPrint) {
     try (StringWriter stringWriter = new StringWriter()) {
-      if (isPrettyPrint) {
-        Object objectToPrint;
-        if (parquetMetaData.getFileMetaData() == null
-            || parquetMetaData.getFileMetaData().getEncryptionType()
-                == FileMetaData.EncryptionType.UNENCRYPTED) {
-          objectToPrint = parquetMetaData;
-        } else {
-          objectToPrint = parquetMetaData.getFileMetaData();
-        }
-        objectMapper.writerWithDefaultPrettyPrinter().writeValue(stringWriter, objectToPrint);
+      Object objectToPrint;
+      if (parquetMetaData.getFileMetaData() == null
+          || parquetMetaData.getFileMetaData().getEncryptionType()
+              == FileMetaData.EncryptionType.UNENCRYPTED) {
+        objectToPrint = parquetMetaData;
       } else {
-        objectMapper.writeValue(stringWriter, parquetMetaData);
+        objectToPrint = parquetMetaData.getFileMetaData();
       }
+
+      ObjectWriter writer;
+      if (isPrettyPrint) {
+        writer = objectMapper.writerWithDefaultPrettyPrinter();
+      } else {
+        writer = objectMapper.writer();
+      }
+
+      writer.writeValue(stringWriter, objectToPrint);
       return stringWriter.toString();
     } catch (IOException e) {
       throw new RuntimeException(e);

@@ -23,6 +23,7 @@ import static org.apache.avro.Schema.Type.LONG;
 import static org.apache.avro.Schema.Type.STRING;
 import static org.apache.avro.SchemaCompatibility.SchemaCompatibilityType.COMPATIBLE;
 import static org.apache.avro.SchemaCompatibility.checkReaderWriterCompatibility;
+import static org.apache.parquet.avro.AvroTestUtil.array;
 import static org.apache.parquet.avro.AvroTestUtil.field;
 import static org.apache.parquet.avro.AvroTestUtil.optionalField;
 import static org.apache.parquet.avro.AvroTestUtil.primitive;
@@ -71,43 +72,43 @@ public class TestAvroSchemaConverter {
     NEW_BEHAVIOR.setBoolean("parquet.avro.write-old-list-structure", false);
   }
 
-  public static final String ALL_PARQUET_SCHEMA =
-      "message org.apache.parquet.avro.myrecord {\n" + "  required boolean myboolean;\n"
-          + "  required int32 myint;\n"
-          + "  required int64 mylong;\n"
-          + "  required float myfloat;\n"
-          + "  required double mydouble;\n"
-          + "  required binary mybytes;\n"
-          + "  required binary mystring (UTF8);\n"
-          + "  required group mynestedrecord {\n"
-          + "    required int32 mynestedint;\n"
-          + "  }\n"
-          + "  required binary myenum (ENUM);\n"
-          + "  required group myarray (LIST) {\n"
-          + "    repeated int32 array;\n"
-          + "  }\n"
-          + "  optional group myoptionalarray (LIST) {\n"
-          + "    repeated int32 array;\n"
-          + "  }\n"
-          + "  required group myarrayofoptional (LIST) {\n"
-          + "    repeated group list {\n"
-          + "      optional int32 element;\n"
-          + "    }\n"
-          + "  }\n"
-          + "  required group myrecordarray (LIST) {\n"
-          + "    repeated group array {\n"
-          + "      required int32 a;\n"
-          + "      required int32 b;\n"
-          + "    }\n"
-          + "  }\n"
-          + "  required group mymap (MAP) {\n"
-          + "    repeated group map (MAP_KEY_VALUE) {\n"
-          + "      required binary key (UTF8);\n"
-          + "      required int32 value;\n"
-          + "    }\n"
-          + "  }\n"
-          + "  required fixed_len_byte_array(1) myfixed;\n"
-          + "}\n";
+  public static final String ALL_PARQUET_SCHEMA = "message org.apache.parquet.avro.myrecord {\n"
+      + "  required boolean myboolean;\n"
+      + "  required int32 myint;\n"
+      + "  required int64 mylong;\n"
+      + "  required float myfloat;\n"
+      + "  required double mydouble;\n"
+      + "  required binary mybytes;\n"
+      + "  required binary mystring (UTF8);\n"
+      + "  required group mynestedrecord {\n"
+      + "    required int32 mynestedint;\n"
+      + "  }\n"
+      + "  required binary myenum (ENUM);\n"
+      + "  required group myarray (LIST) {\n"
+      + "    repeated int32 array;\n"
+      + "  }\n"
+      + "  optional group myoptionalarray (LIST) {\n"
+      + "    repeated int32 array;\n"
+      + "  }\n"
+      + "  required group myarrayofoptional (LIST) {\n"
+      + "    repeated group list {\n"
+      + "      optional int32 element;\n"
+      + "    }\n"
+      + "  }\n"
+      + "  required group myrecordarray (LIST) {\n"
+      + "    repeated group array {\n"
+      + "      required int32 a;\n"
+      + "      required int32 b;\n"
+      + "    }\n"
+      + "  }\n"
+      + "  required group mymap (MAP) {\n"
+      + "    repeated group map (MAP_KEY_VALUE) {\n"
+      + "      required binary key (UTF8);\n"
+      + "      required int32 value;\n"
+      + "    }\n"
+      + "  }\n"
+      + "  required fixed_len_byte_array(1) myfixed;\n"
+      + "}\n";
 
   private void testAvroToParquetConversion(Schema avroSchema, String schemaString) throws Exception {
     testAvroToParquetConversion(new Configuration(false), avroSchema, schemaString);
@@ -420,6 +421,22 @@ public class TestAvroSchemaConverter {
             + "    }\n"
             + "  }\n"
             + "}");
+  }
+
+  @Test
+  public void testConvertUngroupedRepeatedField() throws Exception {
+    testParquetToAvroConversion(
+        NEW_BEHAVIOR,
+        new Schema.Parser()
+            .parse("{\"type\": \"record\","
+                + "  \"name\": \"SchemaWithRepeatedField\","
+                + "  \"fields\": [{"
+                + "    \"name\": \"repeatedField\","
+                + "    \"type\": {\"type\": \"array\",\"items\": \"int\"},"
+                + "    \"default\": []"
+                + "  }]"
+                + "}"),
+        "message SchemaWithRepeatedField { repeated int32 repeatedField; }");
   }
 
   @Test
@@ -746,12 +763,13 @@ public class TestAvroSchemaConverter {
     Schema outerA1 = record("a1", field("a2", primitive(Schema.Type.FLOAT)), optionalField("a1", innerA1));
     Schema schema = record("Message", optionalField("a1", outerA1));
 
-    String parquetSchema = "message Message {\n" + "      optional group a1 {\n"
-        + "        required float a2;\n"
-        + "        optional group a1 {\n"
-        + "          required float a4;\n"
-        + "         }\n"
-        + "      }\n"
+    String parquetSchema = "message Message {\n"
+        + "  optional group a1 {\n"
+        + "    required float a2;\n"
+        + "    optional group a1 {\n"
+        + "      required float a4;\n"
+        + "     }\n"
+        + "  }\n"
         + "}\n";
 
     testParquetToAvroConversion(schema, parquetSchema);
@@ -769,17 +787,43 @@ public class TestAvroSchemaConverter {
 
     Schema schema = record("Message", optionalField("a1", a1), optionalField("a3", a3));
 
-    String parquetSchema = "message Message {\n" + "      optional group a1 {\n"
-        + "        optional group a2 {\n"
-        + "          required float a4;\n"
-        + "         }\n"
-        + "      }\n"
-        + "      optional group a3 {\n"
-        + "        optional group a2 {\n"
-        + "          required float a4;\n"
-        + "          required float a5;\n"
-        + "         }\n"
-        + "      }\n"
+    String parquetSchema = "message Message {\n"
+        + "  optional group a1 {\n"
+        + "    optional group a2 {\n"
+        + "      required float a4;\n"
+        + "     }\n"
+        + "  }\n"
+        + "  optional group a3 {\n"
+        + "    optional group a2 {\n"
+        + "      required float a4;\n"
+        + "      required float a5;\n"
+        + "     }\n"
+        + "  }\n"
+        + "}\n";
+
+    testParquetToAvroConversion(schema, parquetSchema);
+    testParquetToAvroConversion(NEW_BEHAVIOR, schema, parquetSchema);
+  }
+
+  @Test
+  public void testReuseNamesArrays() throws Exception {
+    Schema a1 = record("array", field("a4", primitive(Schema.Type.FLOAT)));
+    Schema a2 = Schema.createFixed("array", null, "array2", 1);
+    Schema a3 = Schema.createFixed("array", null, "array3", 1);
+    Schema schema = record("Message", field("a1", array(a1)), field("a2", array(a2)), field("a3", array(a3)));
+
+    String parquetSchema = "message Message {\n"
+        + "  required group a1 (LIST) {\n"
+        + "    repeated group array {\n"
+        + "      required float a4;\n"
+        + "    }\n"
+        + "  }\n"
+        + "  required group a2 (LIST) {\n"
+        + "    repeated fixed_len_byte_array(1) array;\n"
+        + "  }\n"
+        + "  required group a3 (LIST) {\n"
+        + "    repeated fixed_len_byte_array(1) array;\n"
+        + "  }\n"
         + "}\n";
 
     testParquetToAvroConversion(schema, parquetSchema);

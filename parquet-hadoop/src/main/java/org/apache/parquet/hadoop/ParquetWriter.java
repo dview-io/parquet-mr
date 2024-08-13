@@ -20,8 +20,12 @@ package org.apache.parquet.hadoop;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.nio.file.Paths;
+import java.util.HashMap;
+import java.util.Map;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.Path;
+import org.apache.parquet.bytes.ByteBufferAllocator;
 import org.apache.parquet.column.ParquetProperties;
 import org.apache.parquet.column.ParquetProperties.WriterVersion;
 import org.apache.parquet.compression.CompressionCodecFactory;
@@ -384,34 +388,39 @@ public class ParquetWriter<T> implements Closeable {
     // attached.
     if (encryptionProperties == null) {
       String path = file == null ? null : file.getPath();
-      Configuration hadoopConf = ConfigurationUtil.createHadoopConfiguration(conf);
-      encryptionProperties = ParquetOutputFormat.createEncryptionProperties(
-          hadoopConf, path == null ? null : new Path(path), writeContext);
+      encryptionProperties = EncryptionPropertiesHelper.createEncryptionProperties(
+          conf, path == null ? null : Paths.get(path), writeContext);
     }
 
     ParquetFileWriter fileWriter = new ParquetFileWriter(
-        file,
-        schema,
-        mode,
-        rowGroupSize,
-        maxPaddingSize,
-        encodingProps.getColumnIndexTruncateLength(),
-        encodingProps.getStatisticsTruncateLength(),
-        encodingProps.getPageWriteChecksumEnabled(),
-        encryptionProperties);
+        file, schema, mode, rowGroupSize, maxPaddingSize, encryptionProperties, encodingProps);
     fileWriter.start();
 
     this.codecFactory = codecFactory;
     CompressionCodecFactory.BytesInputCompressor compressor = codecFactory.getCompressor(compressionCodecName);
+
+    final Map<String, String> extraMetadata;
+    if (encodingProps.getExtraMetaData() == null
+        || encodingProps.getExtraMetaData().isEmpty()) {
+      extraMetadata = writeContext.getExtraMetaData();
+    } else {
+      extraMetadata = new HashMap<>(writeContext.getExtraMetaData());
+
+      encodingProps.getExtraMetaData().forEach((metadataKey, metadataValue) -> {
+        if (metadataKey.equals(OBJECT_MODEL_NAME_PROP)) {
+          throw new IllegalArgumentException("Cannot overwrite metadata key " + OBJECT_MODEL_NAME_PROP
+              + ". Please use another key name.");
+        }
+
+        if (extraMetadata.put(metadataKey, metadataValue) != null) {
+          throw new IllegalArgumentException(
+              "Duplicate metadata key " + metadataKey + ". Please use another key name.");
+        }
+      });
+    }
+
     this.writer = new InternalParquetRecordWriter<T>(
-        fileWriter,
-        writeSupport,
-        schema,
-        writeContext.getExtraMetaData(),
-        rowGroupSize,
-        compressor,
-        validating,
-        encodingProps);
+        fileWriter, writeSupport, schema, extraMetadata, rowGroupSize, compressor, validating, encodingProps);
   }
 
   public void write(T object) throws IOException {
@@ -486,7 +495,9 @@ public class ParquetWriter<T> implements Closeable {
     /**
      * @param conf a configuration
      * @return an appropriate WriteSupport for the object model.
+     * @deprecated Use {@link #getWriteSupport(ParquetConfiguration)} instead
      */
+    @Deprecated
     protected abstract WriteSupport<T> getWriteSupport(Configuration conf);
 
     /**
@@ -494,8 +505,7 @@ public class ParquetWriter<T> implements Closeable {
      * @return an appropriate WriteSupport for the object model.
      */
     protected WriteSupport<T> getWriteSupport(ParquetConfiguration conf) {
-      throw new UnsupportedOperationException(
-          "Override ParquetWriter$Builder#getWriteSupport(ParquetConfiguration)");
+      return getWriteSupport(ConfigurationUtil.createHadoopConfiguration(conf));
     }
 
     /**
@@ -850,6 +860,28 @@ public class ParquetWriter<T> implements Closeable {
     }
 
     /**
+     * Sets additional metadata entries to be included in the file footer.
+     *
+     * @param extraMetaData a Map of additional stringly-typed metadata entries
+     * @return this builder for method chaining
+     */
+    public SELF withExtraMetaData(Map<String, String> extraMetaData) {
+      encodingPropsBuilder.withExtraMetaData(extraMetaData);
+      return self();
+    }
+
+    /**
+     * Sets the ByteBuffer allocator instance to be used for allocating memory for writing.
+     *
+     * @param allocator the allocator instance
+     * @return this builder for method chaining
+     */
+    public SELF withAllocator(ByteBufferAllocator allocator) {
+      encodingPropsBuilder.withAllocator(allocator);
+      return self();
+    }
+
+    /**
      * Set a property that will be available to the read path. For writers that use a Hadoop
      * configuration, this is the recommended way to add configuration values.
      *
@@ -879,31 +911,21 @@ public class ParquetWriter<T> implements Closeable {
       if (codecFactory == null) {
         codecFactory = new CodecFactory(conf, encodingProps.getPageSizeThreshold());
       }
-      if (file != null) {
-        return new ParquetWriter<>(
-            file,
-            mode,
-            getWriteSupport(conf),
-            codecName,
-            rowGroupSize,
-            enableValidation,
-            conf,
-            maxPaddingSize,
-            encodingProps,
-            encryptionProperties);
-      } else {
-        return new ParquetWriter<>(
-            HadoopOutputFile.fromPath(path, ConfigurationUtil.createHadoopConfiguration(conf)),
-            mode,
-            getWriteSupport(conf),
-            codecName,
-            rowGroupSize,
-            enableValidation,
-            conf,
-            maxPaddingSize,
-            encodingProps,
-            encryptionProperties);
-      }
+
+      return new ParquetWriter<>(
+          (file != null)
+              ? file
+              : HadoopOutputFile.fromPath(path, ConfigurationUtil.createHadoopConfiguration(conf)),
+          mode,
+          getWriteSupport(conf),
+          codecName,
+          codecFactory,
+          rowGroupSize,
+          enableValidation,
+          conf,
+          maxPaddingSize,
+          encodingProps,
+          encryptionProperties);
     }
   }
 }
